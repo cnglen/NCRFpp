@@ -67,14 +67,15 @@ class CRF(nn.Module):
         print("build CRF ...")
         self.gpu = gpu
         # Matrix of transition parameters.  Entry i,j is the score of transitioning *to* i *from* j.
+        # NOTE: (i,j): score from i -> j
         self.tagset_size = tagset_size
         # # We add 2 here, because of START_TAG and STOP_TAG
         # # transitions (f_tag_size, t_tag_size), transition value from f_tag to t_tag
         init_transitions = torch.zeros(self.tagset_size + 2, self.tagset_size + 2)
         init_transitions[:, START_TAG] = -10000.0
         init_transitions[STOP_TAG, :] = -10000.0
-        init_transitions[:, 0] = -10000.0
-        init_transitions[0, :] = -10000.0
+        init_transitions[:, 0] = -10000.0  # ??
+        init_transitions[0, :] = -10000.0  # ??
         if self.gpu:
             init_transitions = init_transitions.cuda()
         self.transitions = nn.Parameter(init_transitions)
@@ -101,14 +102,37 @@ class CRF(nn.Module):
         print("batch_size={}, seq_len={}, tag_size={}".format(batch_size, seq_len, tag_size))
         assert(tag_size == self.tagset_size + 2)
         mask = mask.transpose(1, 0).contiguous()  # (seq_len, batch_size)
-        ins_num = seq_len * batch_size
 
-        # be careful the view shape, it is .view(ins_num, 1, tag_size) but not .view(ins_num, tag_size, 1)
-        feats = feats.transpose(1, 0).contiguous().view(ins_num, 1, tag_size).expand(ins_num, tag_size, tag_size)
+        # version2: feats, self.transitions -> scores
+        # Input:
+        #   feats: score of (B/M/E/S) @ (batch_size, seq_len)
+        #   self.transitions: score of transition of each pair: i->j
+        #
+        # Output:
+        #   scores: score of transition of each pair @ (batch_size, seq_len)
+        #
+        # Implemnation:
+        # feats:
+        #   (batch_size, seq_len, tag_size)
+        #   -> (batch_size, seq_len, 1, tag_size)
+        #   -> (batch_size, seq_len, tag_size, tag_size)
+        #   -> (seq_len, batch_size, tag_size, tag_size)
+        # self.transitions:
+        #   (tag_size, tag_size)
+        #   -> (1, 1, tag_size, tag_size)
+        #   -> (seq_len, batch_size, tag_size, tag_size)
+        scores = feats.unsqueeze(dim=2).expand(-1, -1, tag_size, -1).transpose(0, 1) + \
+            self.transitions.unsqueeze(dim=0).unsqueeze(dim=0).expand(seq_len, batch_size, -1, -1)
 
-        # need to consider start
-        scores = feats + self.transitions.view(1, tag_size, tag_size).expand(ins_num, tag_size, tag_size)
-        scores = scores.view(seq_len, batch_size, tag_size, tag_size)
+        # # version1: feats, self.transitions -> scores
+        # ins_num = seq_len * batch_size
+        # # be careful the view shape, it is .view(ins_num, 1, tag_size) but not .view(ins_num, tag_size, 1)
+        # # feats(t, i, j): score(i->j) @ t
+        # feats = feats.transpose(1, 0).contiguous().view(ins_num, 1, tag_size).expand(ins_num, tag_size, tag_size)
+
+        # # need to consider start
+        # scores = feats + self.transitions.view(1, tag_size, tag_size).expand(ins_num, tag_size, tag_size)
+        # scores = scores.view(seq_len, batch_size, tag_size, tag_size)
 
         # build iter
         seq_iter = enumerate(scores)
@@ -125,7 +149,7 @@ class CRF(nn.Module):
             # cur_values: bat_size * from_target * to_target
 
             cur_values = cur_values + partition.contiguous().view(batch_size, tag_size, 1).expand(batch_size, tag_size, tag_size)
-            cur_partition = log_sum_exp(cur_values)
+            cur_partition = log_sum_exp(cur_values)  # batch_size, tag_size
             # print cur_partition.data
 
             # (bat_size * from_target * to_target) -> (bat_size * to_target)
