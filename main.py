@@ -20,6 +20,7 @@ import numpy as np
 from utils.metric import get_ner_fmeasure
 from model.seqmodel import SeqModel
 from utils.data import Data
+import logging
 
 seed_num = 42
 random.seed(seed_num)
@@ -325,6 +326,13 @@ def train(data):
             if end > train_num:
                 end = train_num
             instance = data.train_Ids[start:end]
+
+            # debug info
+            word_id_list = instance[0][0]
+            word_list = [data.word_alphabet.get_instance(word_id).encode() for word_id in instance[0][0]]
+            logging.debug("word_list: ", word_list)
+            logging.debug("word_id_list: ", word_id_list)
+
             if not instance:
                 continue
             batch_word, batch_features, batch_wordlen, batch_wordrecover, batch_char, batch_charlen, batch_charrecover, batch_label, mask = batchify_with_label(
