@@ -278,46 +278,42 @@ class CRF(nn.Module):
         path_score = None
         decode_idx = decode_idx.transpose(1, 0)
 
-        score_v2, best_path_v2, last_position_v2, last_partition_v2, max_idx = self._viterbi_decode_v2(
-            orig_feats, orig_mask)
+        score_v2, best_path_v2 = self._viterbi_decode_v2(orig_feats, orig_mask)
         print("---------------------------------------------------")
-        #print((last_position - last_position_v2).abs().sum())
-        #print((max_idx - last_bp).abs().sum())
-        print((best_path_v2 - decode_idx).abs().sum())
-        # print(decode_idx)
+        print(((best_path_v2 - decode_idx).abs() > 0).sum().data.cpu().numpy()[0])
 
-        return path_score, decode_idx
+        return score_v2, best_path_v2
 
     def _viterbi_decode_v2(self, features, mask):
         """
         viterbi decode
 
         Input:
-          features: (batch_size, seq_len, tag_size)
+          features: (batch_size, seq_len, tag_size_to)
           mask:     (batch_size, seq_len)
 
         Output:
-          best_path: (batch_size, seq_len)
+          best_path:  (batch_size, seq_len)
           best_score: (batch_size)
-
-       """
+        """
         batch_size, seq_len, tag_size = features.size()
-
-        length_mask = torch.sum(mask.long(), dim=1, keepdim=True)  # (batch_size, 1)
 
         scores = features.unsqueeze(dim=2).expand(-1, -1, tag_size, -1).transpose(0, 1) + \
             self.transitions.unsqueeze(dim=0).unsqueeze(dim=0).expand(seq_len, batch_size, -1, -1)
 
         # location iterator
-        mask = mask.transpose(1, 0).contiguous()  # (seq_len, batch_size)
-        padded_mask = (1 - mask.long()).byte()      # 1~padded, 0~not padded
+        seq_mask = mask.transpose(1, 0).contiguous()  # (seq_len, batch_size)
+        padded_mask = (1 - seq_mask.long()).byte()      # 1~padded, 0~not padded
+
+        # partition_history[j][batch][tag]: for each location `j`, each `batch`: best score(cumulative) ended in `tag`
+        # back_point_history[j][batch][tag]: for each location `j`, each `batch`: the previous path node of "best path score ended in `tag`"
+        # both element of partition_history and back_point_history: (batch_size, tag_size_to)
         partition_history = []
-        back_points = []
-        sequence_iterator = enumerate(scores)     #
+        back_point_history = []
+        sequence_iterator = enumerate(scores)
         _, init_values = next(sequence_iterator)
         # START_TAG = self.tag2id[self.bos_token]
 
-        # cdf: batch_size, 到每一个tag的分数
         partition = init_values[:, START_TAG, :].clone().view(batch_size, tag_size)  # (batch_size, tag_size_to)
         partition_history.append(partition)
 
@@ -325,76 +321,59 @@ class CRF(nn.Module):
             # score(prev_tag -> current_tag) + score(->prev_tag)
             _tmp = current_score + partition.view(batch_size, tag_size, 1) \
                 .expand(-1, -1, tag_size)      # (batch_size, tag_size_from, tag_size_to)
-
-            partition, max_idx = torch.max(_tmp, dim=1, keepdim=False)
-
-            partition_history.append(partition)
+            partition, back_point = torch.max(_tmp, dim=1, keepdim=False)
             special_value = 0
-            max_idx.masked_fill_(mask=padded_mask[location, :].view(batch_size, 1).expand(-1, tag_size),
-                                 value=special_value)
-            back_points.append(max_idx)
+            back_point.masked_fill_(mask=padded_mask[location, :].view(batch_size, 1).expand(-1, tag_size),
+                                    value=special_value)
+            partition_history.append(partition)
+            back_point_history.append(back_point)
 
-        # ? -> STOP
-        # 每一个batch, 每一个location, to_tag_size的累计最好分数
+        # ? -> STOP:
+        # step1: 每一个batch, 每一个location, to_tag_size的累计最好分数
         partition_history = torch.stack(partition_history, dim=0) \
             .transpose(1, 0) \
             .contiguous()  # (batch_size, seq_len, tag_size)
-
-        # get the last position for each setences, and select the last partitions using gather()
+        # step2: get the last position for each setences, and select the last partitions using gather()
+        length_mask = torch.sum(mask.long(), dim=1, keepdim=True)  # (batch_size, 1)
         last_position = length_mask.view(batch_size, 1, 1).expand(batch_size, 1, tag_size) - 1
         last_partition = torch.gather(partition_history, dim=1, index=last_position)\
                               .view(batch_size, tag_size)
-
+        # step3: get partition, back_point
         _tmp = self.transitions.view(1, tag_size, tag_size).expand(batch_size, tag_size, tag_size) + \
             last_partition.view(batch_size, tag_size, 1).expand(-1, -1, tag_size)
-        partition, max_idx = torch.max(_tmp, dim=1, keepdim=False)
+        partition, back_point = torch.max(_tmp, dim=1, keepdim=False)
         best_score = partition[:, STOP_TAG].squeeze()  # batch_size
 
-        # todo --------------------------------
-        # Make sure the last
+        # pad zero to back_point_history to save the last path node (Note: for no padding sequence)
         pad_zero = autograd.Variable(torch.zeros(batch_size, tag_size)).long()
         if self.gpu:
             pad_zero = pad_zero.cuda()
-        back_points.append(pad_zero)
-        back_points_history = torch.stack(back_points, dim=0).contiguous().clone()  # seq_len, batch_size, tag_size
+        back_point_history.append(pad_zero)
+        back_point_history = torch.stack(back_point_history, dim=0).contiguous()  # seq_len, batch_size, tag_size
 
-        # select end ids in STOP_TAG
-        pointer = max_idx[:, STOP_TAG]
-        insert_last = max_idx[:, STOP_TAG].contiguous().view(
-            batch_size, 1).expand(batch_size, tag_size).unsqueeze(0).clone()
-
-        idx_ = length_mask.view(1, batch_size, 1).expand(1, batch_size, tag_size).clone() - 1
-        back_points_history.scatter_(dim=0, index=idx_, src=insert_last)
-
-        # # move the end ids(expand to tag_size) to the corresponding position of back_points to replace the 0 values
-        # # print "lp:",last_position
-        # # print "il:",insert_last
-        # back_points.scatter_(dim=1, index=last_position, src=insert_last)
-        # # print "bp:",back_points
-        # # exit(0)
-        # back_points = back_points.transpose(1, 0).contiguous()
+        # move the ending tags(expand to tag_size) to the corresponding position of back_point_history to replace the 0 values
+        ending_tag = back_point[:, STOP_TAG].contiguous().view(batch_size, 1).expand(batch_size, tag_size).unsqueeze(0)
+        _last_position = length_mask.view(1, batch_size, 1).expand(1, batch_size, tag_size) - 1
+        back_point_history.scatter_(dim=0, index=_last_position, src=ending_tag)
 
         best_path = autograd.Variable(torch.LongTensor(seq_len, batch_size))
         if self.gpu:
             best_path = best_path.cuda()
 
-        # for padded sequence, will alse insert a wrong path, but will ignored using mask
-        best_path[-1, :] = max_idx[:, STOP_TAG]
+        # for padded sequence, will alse insert a wrong path, but will be corrected by mask
+        best_path[-1, :] = back_point[:, STOP_TAG]
 
-        # back_points_history = torch.stack(back_points, dim=0).contiguous()  # seq_len-1, batch_size, tag_size
         if self.gpu:
-            back_points_history = back_points_history.cuda()
+            back_point_history = back_point_history.cuda()
 
-        print("*" * 58)
-        pointer = pointer.contiguous().view(batch_size, 1).clone()
-        for idx in np.arange(start=back_points_history.size(0) - 2, stop=-1, step=-1):
-            best_path[idx, :] = torch.gather(back_points_history[idx], dim=1, index=pointer)
-            pointer = best_path[idx, :].view(batch_size, 1).clone()
+        for idx in np.arange(start=back_point_history.size(0) - 2, stop=-1, step=-1):
+            best_path[idx, :] = torch.gather(back_point_history[idx], dim=1,
+                                             index=best_path[idx + 1, :].view(batch_size, 1))
 
-        best_path = best_path.transpose(0, 1)
-        return None, best_path, last_position, last_partition, max_idx
+        best_path = best_path.transpose(0, 1) * mask.long()
+        return best_score, best_path
 
-    def forward(self, feats):
+    def forward(self, feats, mask):
         """
         get the path_score, best_path
         """
@@ -446,7 +425,7 @@ class CRF(nn.Module):
 
         # need convert tags id to search from 400 positions of scores
         tg_energy = torch.gather(scores.view(seq_len, batch_size, -1), dim=2, index=new_tags) \
-                         .view(seq_len, batch_size)
+            .view(seq_len, batch_size)
         # mask transpose to (seq_len, batch_size)
         tg_energy = tg_energy.masked_select(mask.transpose(1, 0))
 
